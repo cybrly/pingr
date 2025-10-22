@@ -5,21 +5,26 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ipnet::Ipv4Net;
 use serde_json::json;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use surge_ping::{Client, Config, PingIdentifier, PingSequence};
-use tokio::sync::Semaphore;
+use tokio::signal;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "Fast parallel ICMP ping scanner", long_about = None)]
+#[clap(author, version, about = "A blazing fast network scanner with beautiful terminal output", long_about = None)]
 struct Args {
-    /// Network to scan in CIDR notation
-    #[clap(default_value = "192.168.1.0/24")]
+    /// Network to scan in CIDR notation (can specify multiple)
+    #[clap(default_value = "")]
     cidr: String,
+
+    /// Input file containing IP addresses and/or CIDR ranges (one per line)
+    #[clap(short = 'i', long = "input")]
+    input_file: Option<String>,
 
     /// Show unreachable hosts
     #[clap(short, long)]
@@ -72,6 +77,10 @@ struct Args {
     /// Export format for integration (csv, xml, nmap)
     #[clap(long = "export")]
     export_format: Option<String>,
+
+    /// Auto-save results on interrupt
+    #[clap(long = "autosave", default_value = "true")]
+    autosave: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -87,6 +96,7 @@ struct HostInfo {
     hostname: Option<String>,
     rtt: Option<Duration>,
     attempts: u8,
+    network: String, // Track which network this host belongs to
 }
 
 struct ScanResult {
@@ -97,7 +107,12 @@ struct ScanResult {
     avg_rtt: Option<Duration>,
     min_rtt: Option<Duration>,
     max_rtt: Option<Duration>,
+    interrupted: bool,
+    networks_scanned: Vec<String>,
 }
+
+// Global flag for interrupt handling
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,74 +122,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         colored::control::set_override(false);
     }
 
-    // Parse the CIDR
-    let net: Ipv4Net = match Ipv4Net::from_str(&args.cidr) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!(
-                "{} {}",
-                "✗ Error:".red().bold(),
-                format!("Invalid CIDR '{}': {}", args.cidr, e).red()
-            );
-            std::process::exit(1);
-        }
-    };
+    // Parse input networks from file or command line
+    let networks = parse_input_networks(&args)?;
 
-    let hosts_iterator = net.hosts();
-    let host_count = hosts_iterator.count();
-
-    if host_count == 0 {
+    if networks.is_empty() {
         eprintln!(
-            "{} {}",
-            "⚠".yellow(),
-            format!("No hosts to scan in {}", args.cidr).yellow()
+            "{} No networks to scan. Provide CIDR ranges via command line or use -i <file>",
+            "✗ Error:".red().bold()
         );
-        return Ok(());
+        eprintln!("\nUsage examples:");
+        eprintln!("  pingr 192.168.1.0/24");
+        eprintln!("  pingr -i targets.txt");
+        eprintln!("  pingr 10.0.0.0/24 192.168.1.0/24");
+        std::process::exit(1);
     }
 
-    // Determine concurrency
-    let concurrency = determine_concurrency(&args.concurrency, host_count)?;
+    // Setup interrupt handler
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_clone = interrupted.clone();
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("Failed to listen for Ctrl-C");
+        println!(
+            "\n{} {}",
+            "⚠".yellow().bold(),
+            "Interrupt received! Saving partial results...".yellow()
+        );
+        interrupted_clone.store(true, Ordering::Relaxed);
+        INTERRUPTED.store(true, Ordering::Relaxed);
+    });
+
+    // Shared results storage for graceful shutdown
+    let all_alive_hosts = Arc::new(Mutex::new(Vec::new()));
+    let all_dead_hosts = Arc::new(Mutex::new(Vec::new()));
+
+    // Calculate total hosts
+    let mut total_hosts = 0;
+    let mut network_details = Vec::new();
+
+    for cidr in &networks {
+        match Ipv4Net::from_str(cidr) {
+            Ok(net) => {
+                let host_count = net.hosts().count();
+                total_hosts += host_count;
+                network_details.push((cidr.clone(), net, host_count));
+            }
+            Err(e) => {
+                eprintln!("{} Invalid CIDR '{}': {}", "⚠".yellow(), cidr, e);
+            }
+        }
+    }
 
     if !args.quiet {
-        print_banner(&args.cidr, host_count, concurrency, &args);
+        print_banner_multi(&network_details, total_hosts, &args);
     }
 
     let start_time = Instant::now();
 
-    // Set up rate limiting
-    let rate_limiter = if args.rate_limit > 0 {
-        Some(Arc::new(tokio::sync::Semaphore::new(1)))
-    } else {
-        None
-    };
+    // Determine concurrency for total hosts
+    let concurrency = determine_concurrency(&args.concurrency, total_hosts)?;
 
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-
-    // Progress bars
+    // Create progress bar for all networks
     let multi_progress = MultiProgress::new();
-    let pb = if !args.quiet {
-        let pb = multi_progress.add(ProgressBar::new(host_count as u64));
+    let main_pb = if !args.quiet {
+        let pb = multi_progress.add(ProgressBar::new(total_hosts as u64));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
                 .unwrap()
                 .progress_chars("█▉▊▋▌▍▎▏  "),
         );
+        pb.set_message(format!("Scanning {} networks", networks.len()));
         Some(pb)
     } else {
         None
     };
 
-    // Statistics tracking
-    let success_count = Arc::new(AtomicUsize::new(0));
-    let fail_count = Arc::new(AtomicUsize::new(0));
+    // Setup semaphore and rate limiter
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let rate_limiter = if args.rate_limit > 0 {
+        Some(Arc::new(tokio::sync::Semaphore::new(1)))
+    } else {
+        None
+    };
 
-    // We need to re-create the iterator since .count() consumed it
-    let hosts = net.hosts();
-
-    // Create ping client with custom config
+    // Create ping client
     let config = Config::builder().kind(surge_ping::ICMP::V4).build();
-
     let client = match Client::new(&config) {
         Ok(c) => c,
         Err(e) => {
@@ -192,116 +225,151 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut tasks = Vec::new();
+    // Statistics tracking
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let fail_count = Arc::new(AtomicUsize::new(0));
+
+    let mut all_tasks = Vec::new();
     let timeout_duration = Duration::from_secs(args.timeout);
 
-    // Generate and spawn tasks for all hosts
-    for host in hosts {
-        let client = client.clone();
-        let sem = semaphore.clone();
-        let pb_clone = pb.clone();
-        let success = success_count.clone();
-        let fail = fail_count.clone();
-        let rate_limiter = rate_limiter.clone();
-        let ping_count = args.ping_count;
-        let resolve = args.resolve;
-        let timeout = timeout_duration;
+    // Process each network
+    for (cidr, net, _host_count) in network_details {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            break;
+        }
 
-        let task = tokio::spawn(async move {
-            // Rate limiting
-            if let Some(limiter) = rate_limiter {
-                let _permit = limiter.acquire().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        if !args.quiet {
+            if let Some(pb) = &main_pb {
+                pb.set_message(format!("Scanning {}", cidr.yellow()));
+            }
+        }
+
+        // Generate tasks for this network
+        for host in net.hosts() {
+            if INTERRUPTED.load(Ordering::Relaxed) {
+                break;
             }
 
-            let _permit = sem.acquire().await.unwrap();
+            let client = client.clone();
+            let sem = semaphore.clone();
+            let pb_clone = main_pb.clone();
+            let success = success_count.clone();
+            let fail = fail_count.clone();
+            let rate_limiter = rate_limiter.clone();
+            let alive_hosts_clone = all_alive_hosts.clone();
+            let dead_hosts_clone = all_dead_hosts.clone();
+            let network_cidr = cidr.clone();
+            let ping_count = args.ping_count;
+            let resolve = args.resolve;
+            let timeout = timeout_duration;
+            let verbose = args.verbose;
 
-            let mut successful_pings = 0;
-            let mut total_rtt = Duration::ZERO;
-            let mut min_rtt = Duration::MAX;
-            let mut max_rtt = Duration::ZERO;
-
-            // Multiple ping attempts
-            for attempt in 0..ping_count {
-                if let Some(rtt) = ping_host_with_rtt(client.clone(), host, timeout, attempt).await
-                {
-                    successful_pings += 1;
-                    total_rtt += rtt;
-                    min_rtt = min_rtt.min(rtt);
-                    max_rtt = max_rtt.max(rtt);
+            let task = tokio::spawn(async move {
+                // Check if interrupted before starting
+                if INTERRUPTED.load(Ordering::Relaxed) {
+                    return;
                 }
-            }
 
-            let result = if successful_pings > 0 {
-                success.fetch_add(1, Ordering::Relaxed);
+                // Rate limiting
+                if let Some(limiter) = rate_limiter {
+                    let _permit = limiter.acquire().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
 
-                let avg_rtt = total_rtt / successful_pings as u32;
+                let _permit = sem.acquire().await.unwrap();
 
-                // Resolve hostname if requested
-                let hostname = if resolve {
-                    lookup_addr(&IpAddr::V4(host)).ok()
+                // Check again after acquiring permit
+                if INTERRUPTED.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let mut successful_pings = 0;
+                let mut total_rtt = Duration::ZERO;
+
+                // Multiple ping attempts
+                for attempt in 0..ping_count {
+                    if let Some(rtt) =
+                        ping_host_with_rtt(client.clone(), host, timeout, attempt).await
+                    {
+                        successful_pings += 1;
+                        total_rtt += rtt;
+                    }
+                }
+
+                if successful_pings > 0 {
+                    success.fetch_add(1, Ordering::Relaxed);
+
+                    let avg_rtt = total_rtt / successful_pings as u32;
+
+                    // Resolve hostname if requested
+                    let hostname = if resolve {
+                        lookup_addr(&IpAddr::V4(host)).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(pb) = &pb_clone {
+                        pb.set_message(format!(
+                            "{} {} from {} ({}ms)",
+                            "Found:".green().bold(),
+                            host.to_string().green(),
+                            network_cidr.yellow(),
+                            avg_rtt.as_millis()
+                        ));
+                    }
+
+                    let host_info = HostInfo {
+                        ip: host,
+                        hostname,
+                        rtt: Some(avg_rtt),
+                        attempts: successful_pings,
+                        network: network_cidr,
+                    };
+
+                    let mut hosts = alive_hosts_clone.lock().await;
+                    hosts.push(host_info);
                 } else {
-                    None
-                };
-
-                if let Some(pb) = &pb_clone {
-                    pb.set_message(format!(
-                        "{} {} ({}ms)",
-                        "Found:".green().bold(),
-                        host.to_string().green(),
-                        avg_rtt.as_millis()
-                    ));
+                    fail.fetch_add(1, Ordering::Relaxed);
+                    if verbose {
+                        let mut hosts = dead_hosts_clone.lock().await;
+                        hosts.push(host);
+                    }
                 }
 
-                Some(HostInfo {
-                    ip: host,
-                    hostname,
-                    rtt: Some(avg_rtt),
-                    attempts: successful_pings,
-                })
-            } else {
-                fail.fetch_add(1, Ordering::Relaxed);
-                None
-            };
+                if let Some(pb) = pb_clone {
+                    pb.inc(1);
+                }
+            });
 
-            if let Some(pb) = pb_clone {
-                pb.inc(1);
-            }
-
-            (host, result)
-        });
-
-        tasks.push(task);
-    }
-
-    // Collect results
-    let mut alive_hosts = Vec::new();
-    let mut dead_hosts = Vec::new();
-    let mut all_rtts = Vec::new();
-
-    for task in tasks {
-        let (host, info) = task.await?;
-        if let Some(host_info) = info {
-            if let Some(rtt) = host_info.rtt {
-                all_rtts.push(rtt);
-            }
-            alive_hosts.push(host_info);
-        } else if args.verbose {
-            dead_hosts.push(host);
+            all_tasks.push(task);
         }
     }
 
-    if let Some(pb) = pb {
+    // Wait for all tasks or interruption
+    for task in all_tasks {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            task.abort();
+        } else {
+            let _ = task.await;
+        }
+    }
+
+    if let Some(pb) = main_pb {
         pb.finish_and_clear();
     }
 
     let scan_duration = start_time.elapsed();
 
+    // Collect final results
+    let mut alive_hosts = all_alive_hosts.lock().await.clone();
+    let dead_hosts = all_dead_hosts.lock().await.clone();
+
     // Sort results
-    alive_hosts.sort_by_key(|h| h.ip);
-    dead_hosts.sort();
+    alive_hosts.sort_by(|a, b| a.network.cmp(&b.network).then(a.ip.cmp(&b.ip)));
 
     // Calculate statistics
+    let all_rtts: Vec<Duration> = alive_hosts.iter().filter_map(|h| h.rtt).collect();
+
     let (avg_rtt, min_rtt, max_rtt) = if !all_rtts.is_empty() {
         let sum: Duration = all_rtts.iter().sum();
         let avg = sum / all_rtts.len() as u32;
@@ -312,14 +380,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None, None)
     };
 
+    let was_interrupted = INTERRUPTED.load(Ordering::Relaxed);
+
     let result = ScanResult {
         alive_hosts: alive_hosts.clone(),
         dead_hosts: dead_hosts.clone(),
         scan_duration,
-        total_scanned: host_count,
+        total_scanned: success_count.load(Ordering::Relaxed) + fail_count.load(Ordering::Relaxed),
         avg_rtt,
         min_rtt,
         max_rtt,
+        interrupted: was_interrupted,
+        networks_scanned: networks,
     };
 
     // Display results
@@ -328,16 +400,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for host in &result.alive_hosts {
             if let Some(hostname) = &host.hostname {
-                println!("{} ({})", host.ip, hostname);
+                println!("{} ({}) [{}]", host.ip, hostname, host.network);
             } else {
-                println!("{}", host.ip);
+                println!("{} [{}]", host.ip, host.network);
             }
         }
     }
 
-    // Save to file if requested
-    if let Some(output_path) = args.output {
+    // Save to file if requested or if interrupted with autosave
+    if args.output.is_some() || (was_interrupted && args.autosave) {
+        let output_path = args.output.unwrap_or_else(|| {
+            format!(
+                "pingr_interrupted_{}",
+                chrono::Local::now().format("%Y%m%d_%H%M%S")
+            )
+        });
+
         save_results(&result, &output_path, &args.format)?;
+
+        if was_interrupted {
+            println!(
+                "{} Partial results saved to: {}",
+                "💾".green(),
+                format!("{}.txt/json", output_path).white().bold()
+            );
+        }
     }
 
     // Export in special formats
@@ -348,51 +435,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn determine_concurrency(
-    concurrency_str: &str,
-    host_count: usize,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    if concurrency_str == "auto" {
-        // Automatic optimization based on network size
-        let optimal = match host_count {
-            0..=256 => host_count.min(256), // /24 or smaller
-            257..=1024 => 512,              // /22 to /20
-            1025..=4096 => 1024,            // /20 to /18
-            4097..=16384 => 2048,           // /18 to /16
-            16385..=65536 => 4096,          // /16 to /14
-            _ => 8192,                      // Larger networks
-        };
+fn parse_input_networks(args: &Args) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut networks = Vec::new();
+
+    // Parse from input file if provided
+    if let Some(input_file) = &args.input_file {
+        let file = File::open(input_file)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+
+            // Skip empty lines and comments
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // Check if it's a single IP or CIDR
+            if trimmed.contains('/') {
+                // CIDR notation
+                networks.push(trimmed.to_string());
+            } else if trimmed.parse::<Ipv4Addr>().is_ok() {
+                // Single IP - convert to /32
+                networks.push(format!("{}/32", trimmed));
+            } else {
+                eprintln!("{} Invalid entry in input file: {}", "⚠".yellow(), trimmed);
+            }
+        }
 
         println!(
-            "{} Auto-selected {} threads for {} hosts",
-            "🔧".blue(),
-            optimal.to_string().yellow().bold(),
-            host_count
+            "{} Loaded {} networks from {}",
+            "📁".blue(),
+            networks.len(),
+            input_file.white().bold()
         );
-        Ok(optimal)
-    } else {
-        Ok(concurrency_str.parse()?)
     }
+
+    // Parse from command line (can be multiple)
+    if !args.cidr.is_empty() {
+        let parts: Vec<&str> = args.cidr.split_whitespace().collect();
+        for part in parts {
+            if part.contains('/') {
+                networks.push(part.to_string());
+            } else if part.parse::<Ipv4Addr>().is_ok() {
+                networks.push(format!("{}/32", part));
+            } else if !part.is_empty() {
+                eprintln!("{} Invalid CIDR: {}", "⚠".yellow(), part);
+            }
+        }
+    }
+
+    // If still no networks and no input file was specified, use default
+    if networks.is_empty() && args.input_file.is_none() && args.cidr.is_empty() {
+        networks.push("192.168.1.0/24".to_string());
+    }
+
+    Ok(networks)
 }
 
-async fn ping_host_with_rtt(
-    client: Client,
-    host: Ipv4Addr,
-    timeout: Duration,
-    sequence: u8,
-) -> Option<Duration> {
-    let payload = vec![0; 56]; // Standard ping payload size
-    let mut pinger = client.pinger(IpAddr::V4(host), PingIdentifier(1)).await;
-    pinger.timeout(timeout);
-
-    let start = Instant::now();
-    match pinger.ping(PingSequence(sequence as u16), &payload).await {
-        Ok(_) => Some(start.elapsed()),
-        Err(_) => None,
-    }
-}
-
-fn print_banner(cidr: &str, host_count: usize, concurrency: usize, args: &Args) {
+fn print_banner_multi(
+    network_details: &[(String, Ipv4Net, usize)],
+    total_hosts: usize,
+    args: &Args,
+) {
     println!(
         "\n{}",
         "═══════════════════════════════════════════════════════"
@@ -401,7 +507,7 @@ fn print_banner(cidr: &str, host_count: usize, concurrency: usize, args: &Args) 
     );
     println!(
         "{}",
-        "           PINGSWEEP - Network Scanner v0.2.0           "
+        "                PINGR - Network Scanner v0.1.0          "
             .cyan()
             .bold()
     );
@@ -413,19 +519,30 @@ fn print_banner(cidr: &str, host_count: usize, concurrency: usize, args: &Args) 
     );
 
     println!(
+        "\n{} {} networks to scan:",
+        "📡".white(),
+        network_details.len().to_string().yellow().bold()
+    );
+    for (cidr, _, host_count) in network_details.iter().take(5) {
+        println!(
+            "   {} {} ({} hosts)",
+            "├─".blue(),
+            cidr.white(),
+            host_count.to_string().yellow()
+        );
+    }
+    if network_details.len() > 5 {
+        println!(
+            "   {} ... and {} more networks",
+            "└─".blue(),
+            (network_details.len() - 5).to_string().yellow()
+        );
+    }
+
+    println!(
         "\n{} {}",
-        "📡 Target Network:".white().bold(),
-        cidr.yellow()
-    );
-    println!(
-        "{} {}",
-        "🔢 Hosts to scan:".white().bold(),
-        host_count.to_string().yellow()
-    );
-    println!(
-        "{} {}",
-        "⚡ Concurrency:".white().bold(),
-        format!("{} threads", concurrency).yellow()
+        "🔢 Total hosts:".white().bold(),
+        total_hosts.to_string().yellow()
     );
     println!(
         "{} {}",
@@ -454,25 +571,82 @@ fn print_banner(cidr: &str, host_count: usize, concurrency: usize, args: &Args) 
         );
     }
 
+    println!(
+        "{} {}",
+        "🛡️  Interrupt handling:".white().bold(),
+        "Enabled (Ctrl-C to save partial results)".green()
+    );
+
     println!("{}", "─".repeat(56).blue());
 }
 
+fn determine_concurrency(
+    concurrency_str: &str,
+    host_count: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if concurrency_str == "auto" {
+        let optimal = match host_count {
+            0..=256 => host_count.min(256),
+            257..=1024 => 512,
+            1025..=4096 => 1024,
+            4097..=16384 => 2048,
+            16385..=65536 => 4096,
+            _ => 8192,
+        };
+
+        println!(
+            "{} Auto-selected {} threads for {} hosts",
+            "🔧".blue(),
+            optimal.to_string().yellow().bold(),
+            host_count
+        );
+        Ok(optimal)
+    } else {
+        Ok(concurrency_str.parse()?)
+    }
+}
+
+async fn ping_host_with_rtt(
+    client: Client,
+    host: Ipv4Addr,
+    timeout: Duration,
+    sequence: u8,
+) -> Option<Duration> {
+    let payload = vec![0; 56];
+    let mut pinger = client.pinger(IpAddr::V4(host), PingIdentifier(1)).await;
+    pinger.timeout(timeout);
+
+    let start = Instant::now();
+    match pinger.ping(PingSequence(sequence as u16), &payload).await {
+        Ok(_) => Some(start.elapsed()),
+        Err(_) => None,
+    }
+}
+
 fn display_results(result: &ScanResult, args: &Args) {
-    println!(
-        "\n{}",
-        "═══════════════════════════════════════════════════════"
-            .green()
-            .bold()
-    );
-    println!(
-        "{}",
+    let header = if result.interrupted {
+        format!(
+            "    ⚠ SCAN INTERRUPTED - Found {} Live Hosts    ",
+            result.alive_hosts.len()
+        )
+        .yellow()
+        .bold()
+    } else {
         format!(
             "    ✅ SCAN COMPLETE - Found {} Live Hosts    ",
             result.alive_hosts.len()
         )
         .green()
         .bold()
+    };
+
+    println!(
+        "\n{}",
+        "═══════════════════════════════════════════════════════"
+            .green()
+            .bold()
     );
+    println!("{}", header);
     println!(
         "{}",
         "═══════════════════════════════════════════════════════"
@@ -481,38 +655,59 @@ fn display_results(result: &ScanResult, args: &Args) {
     );
 
     if !result.alive_hosts.is_empty() {
-        println!("\n{}", "🟢 Live Hosts:".green().bold());
+        // Group hosts by network
+        let mut by_network: std::collections::HashMap<String, Vec<&HostInfo>> =
+            std::collections::HashMap::new();
+        for host in &result.alive_hosts {
+            by_network
+                .entry(host.network.clone())
+                .or_insert_with(Vec::new)
+                .push(host);
+        }
+
+        println!("\n{}", "🟢 Live Hosts by Network:".green().bold());
         println!("{}", "─".repeat(56).green());
 
-        for (i, host) in result.alive_hosts.iter().enumerate() {
-            let prefix = if i == result.alive_hosts.len() - 1 {
-                "└─"
-            } else {
-                "├─"
-            };
+        for network in &result.networks_scanned {
+            if let Some(hosts) = by_network.get(network) {
+                println!(
+                    "\n  {} {} ({} hosts)",
+                    "📍".cyan(),
+                    network.yellow().bold(),
+                    hosts.len()
+                );
 
-            let mut info = host.ip.to_string();
+                for (i, host) in hosts.iter().enumerate() {
+                    let prefix = if i == hosts.len() - 1 {
+                        "    └─"
+                    } else {
+                        "    ├─"
+                    };
 
-            if let Some(hostname) = &host.hostname {
-                info = format!("{} ({})", info, hostname.cyan());
+                    let mut info = host.ip.to_string();
+
+                    if let Some(hostname) = &host.hostname {
+                        info = format!("{} ({})", info, hostname.cyan());
+                    }
+
+                    if let Some(rtt) = host.rtt {
+                        let rtt_color = if rtt.as_millis() < 10 {
+                            format!("{}ms", rtt.as_millis()).green()
+                        } else if rtt.as_millis() < 50 {
+                            format!("{}ms", rtt.as_millis()).yellow()
+                        } else {
+                            format!("{}ms", rtt.as_millis()).red()
+                        };
+                        info = format!("{} - {}", info, rtt_color);
+                    }
+
+                    if args.ping_count > 1 {
+                        info = format!("{} [{}/{} replies]", info, host.attempts, args.ping_count);
+                    }
+
+                    println!("{} {}", prefix.green(), info.white().bold());
+                }
             }
-
-            if let Some(rtt) = host.rtt {
-                let rtt_color = if rtt.as_millis() < 10 {
-                    format!("{}ms", rtt.as_millis()).green()
-                } else if rtt.as_millis() < 50 {
-                    format!("{}ms", rtt.as_millis()).yellow()
-                } else {
-                    format!("{}ms", rtt.as_millis()).red()
-                };
-                info = format!("{} - {}", info, rtt_color);
-            }
-
-            if args.ping_count > 1 {
-                info = format!("{} [{}/{} replies]", info, host.attempts, args.ping_count);
-            }
-
-            println!("  {} {}", prefix.green(), info.white().bold());
         }
     } else {
         println!("\n{} {}", "⚠".yellow(), "No live hosts found".yellow());
@@ -530,9 +725,11 @@ fn display_results(result: &ScanResult, args: &Args) {
     println!("\n{}", "📊 Statistics:".cyan().bold());
     println!("{}", "─".repeat(56).cyan());
 
-    let success_rate =
-        (result.alive_hosts.len() as f32 / result.total_scanned as f32 * 100.0) as u32;
-
+    println!(
+        "  {} {}",
+        "Networks Scanned:".white(),
+        result.networks_scanned.len().to_string().yellow()
+    );
     println!(
         "  {} {}",
         "Total Scanned:".white(),
@@ -551,6 +748,12 @@ fn display_results(result: &ScanResult, args: &Args) {
             result.dead_hosts.len().to_string().red()
         );
     }
+
+    let success_rate = if result.total_scanned > 0 {
+        (result.alive_hosts.len() as f32 / result.total_scanned as f32 * 100.0) as u32
+    } else {
+        0
+    };
 
     let success_text = format!("{}%", success_rate);
     let colored_success = if success_rate > 50 {
@@ -591,12 +794,24 @@ fn display_results(result: &ScanResult, args: &Args) {
         format!("{:.2}s", result.scan_duration.as_secs_f32()).yellow()
     );
 
-    let scan_rate = result.total_scanned as f32 / result.scan_duration.as_secs_f32();
+    let scan_rate = if result.scan_duration.as_secs_f32() > 0.0 {
+        result.total_scanned as f32 / result.scan_duration.as_secs_f32()
+    } else {
+        0.0
+    };
     println!(
         "  {} {}",
         "Scan Rate:".white(),
         format!("{:.0} hosts/sec", scan_rate).cyan()
     );
+
+    if result.interrupted {
+        println!(
+            "\n  {} {}",
+            "Status:".white(),
+            "INTERRUPTED - Partial results saved".yellow().bold()
+        );
+    }
 
     println!("{}", "═".repeat(56).blue().bold());
 }
@@ -611,30 +826,53 @@ fn save_results(
             let txt_path = format!("{}.txt", output_path);
             let mut file = File::create(&txt_path)?;
 
-            writeln!(file, "# Pingsweep Scan Results")?;
+            writeln!(file, "# Pingr Scan Results")?;
             writeln!(
                 file,
                 "# Generated: {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
             )?;
+            if result.interrupted {
+                writeln!(file, "# Status: INTERRUPTED - Partial Results")?;
+            }
             writeln!(
                 file,
                 "# Scan Duration: {:.2}s",
                 result.scan_duration.as_secs_f32()
             )?;
-            writeln!(file, "# Total Hosts: {}", result.total_scanned)?;
+            writeln!(
+                file,
+                "# Networks Scanned: {}",
+                result.networks_scanned.join(", ")
+            )?;
+            writeln!(file, "# Total Hosts Scanned: {}", result.total_scanned)?;
             writeln!(file, "# Alive Hosts: {}", result.alive_hosts.len())?;
             writeln!(file, "#")?;
 
+            // Group by network
+            let mut by_network: std::collections::HashMap<String, Vec<&HostInfo>> =
+                std::collections::HashMap::new();
             for host in &result.alive_hosts {
-                let mut line = host.ip.to_string();
-                if let Some(hostname) = &host.hostname {
-                    line = format!("{}\t{}", line, hostname);
+                by_network
+                    .entry(host.network.clone())
+                    .or_insert_with(Vec::new)
+                    .push(host);
+            }
+
+            for network in &result.networks_scanned {
+                if let Some(hosts) = by_network.get(network) {
+                    writeln!(file, "\n# Network: {}", network)?;
+                    for host in hosts {
+                        let mut line = host.ip.to_string();
+                        if let Some(hostname) = &host.hostname {
+                            line = format!("{}\t{}", line, hostname);
+                        }
+                        if let Some(rtt) = host.rtt {
+                            line = format!("{}\t{}ms", line, rtt.as_millis());
+                        }
+                        writeln!(file, "{}", line)?;
+                    }
                 }
-                if let Some(rtt) = host.rtt {
-                    line = format!("{}\t{}ms", line, rtt.as_millis());
-                }
-                writeln!(file, "{}", line)?;
             }
 
             println!(
@@ -657,6 +895,7 @@ fn save_results(
                     json!({
                         "ip": h.ip.to_string(),
                         "hostname": h.hostname,
+                        "network": h.network,
                         "rtt_ms": h.rtt.map(|r| r.as_millis()),
                         "successful_pings": h.attempts,
                     })
@@ -666,11 +905,13 @@ fn save_results(
             let json_data = json!({
                 "scan_info": {
                     "timestamp": chrono::Local::now().to_rfc3339(),
+                    "interrupted": result.interrupted,
                     "duration_seconds": result.scan_duration.as_secs_f32(),
+                    "networks_scanned": result.networks_scanned,
                     "total_hosts": result.total_scanned,
                     "alive_count": result.alive_hosts.len(),
                     "dead_count": result.dead_hosts.len(),
-                    "success_rate": (result.alive_hosts.len() as f32 / result.total_scanned as f32 * 100.0) as u32,
+                    "success_rate": (result.alive_hosts.len() as f32 / result.total_scanned.max(1) as f32 * 100.0) as u32,
                     "rtt_stats": {
                         "avg_ms": result.avg_rtt.map(|r| r.as_millis()),
                         "min_ms": result.min_rtt.map(|r| r.as_millis()),
@@ -699,40 +940,55 @@ fn save_results(
 fn export_results(result: &ScanResult, format: &str) -> std::io::Result<()> {
     match format {
         "csv" => {
-            let mut file = File::create("pingsweep_export.csv")?;
-            writeln!(file, "IP,Hostname,RTT_ms,Status")?;
+            let filename = if result.interrupted {
+                format!(
+                    "pingr_export_interrupted_{}.csv",
+                    chrono::Local::now().format("%Y%m%d_%H%M%S")
+                )
+            } else {
+                "pingr_export.csv".to_string()
+            };
+
+            let mut file = File::create(&filename)?;
+            writeln!(file, "IP,Hostname,Network,RTT_ms,Status")?;
 
             for host in &result.alive_hosts {
                 writeln!(
                     file,
-                    "{},{},{},alive",
+                    "{},{},{},{},alive",
                     host.ip,
                     host.hostname.as_ref().unwrap_or(&String::from("")),
+                    host.network,
                     host.rtt.map(|r| r.as_millis()).unwrap_or(0)
                 )?;
             }
 
             for host in &result.dead_hosts {
-                writeln!(file, "{},,,dead", host)?;
+                writeln!(file, "{},,,,dead", host)?;
             }
 
             println!(
                 "{} {}",
                 "📊 Exported CSV to:".green(),
-                "pingsweep_export.csv".white().bold()
+                filename.white().bold()
             );
         }
         "nmap" => {
-            let mut file = File::create("pingsweep_export.gnmap")?;
+            let filename = if result.interrupted {
+                format!(
+                    "pingr_export_interrupted_{}.gnmap",
+                    chrono::Local::now().format("%Y%m%d_%H%M%S")
+                )
+            } else {
+                "pingr_export.gnmap".to_string()
+            };
+
+            let mut file = File::create(&filename)?;
             writeln!(
                 file,
-                "# Nmap 7.94 scan initiated {} as: pingsweep {}",
+                "# Nmap 7.94 scan initiated {} as: pingr {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M"),
-                result
-                    .alive_hosts
-                    .first()
-                    .map(|h| h.ip.to_string())
-                    .unwrap_or_default()
+                result.networks_scanned.join(" ")
             )?;
 
             for host in &result.alive_hosts {
@@ -742,7 +998,7 @@ fn export_results(result: &ScanResult, format: &str) -> std::io::Result<()> {
             println!(
                 "{} {}",
                 "🗺️  Exported nmap format to:".green(),
-                "pingsweep_export.gnmap".white().bold()
+                filename.white().bold()
             );
         }
         _ => {
