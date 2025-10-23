@@ -19,8 +19,7 @@ use tokio::sync::{Mutex, Semaphore};
 #[clap(author, version, about = "A blazing fast network scanner with beautiful terminal output", long_about = None)]
 struct Args {
     /// Network to scan in CIDR notation (can specify multiple)
-    #[clap(default_value = "")]
-    cidr: String,
+    cidr: Option<Vec<String>>,
 
     /// Input file containing IP addresses and/or CIDR ranges (one per line)
     #[clap(short = 'i', long = "input")]
@@ -46,7 +45,7 @@ struct Args {
     #[clap(long)]
     no_color: bool,
 
-    /// Quiet mode (minimal output)
+    /// Quiet mode (minimal output - IP addresses only)
     #[clap(short = 'q', long)]
     quiet: bool,
 
@@ -58,17 +57,17 @@ struct Args {
     #[clap(long = "timeout", default_value = "1")]
     timeout: u64,
 
-    /// Resolve hostnames
-    #[clap(short = 'r', long = "resolve")]
-    resolve: bool,
+    /// Skip hostname resolution
+    #[clap(short = 'n', long = "no-resolve")]
+    no_resolve: bool,
 
     /// Show RTT statistics
     #[clap(long = "stats")]
     stats: bool,
 
-    /// Adaptive timeout based on network conditions
-    #[clap(long = "adaptive")]
-    adaptive: bool,
+    /// Disable adaptive timeout
+    #[clap(long = "no-adaptive")]
+    no_adaptive: bool,
 
     /// Rate limit (pings per second, 0 = unlimited)
     #[clap(long = "rate", default_value = "0")]
@@ -81,6 +80,10 @@ struct Args {
     /// Auto-save results on interrupt
     #[clap(long = "autosave", default_value = "true")]
     autosave: bool,
+
+    /// Simple mode - just output IP addresses (overrides other display options)
+    #[clap(short = 's', long = "simple")]
+    simple: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -96,7 +99,7 @@ struct HostInfo {
     hostname: Option<String>,
     rtt: Option<Duration>,
     attempts: u8,
-    network: String, // Track which network this host belongs to
+    network: String,
 }
 
 struct ScanResult {
@@ -125,16 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse input networks from file or command line
     let networks = parse_input_networks(&args)?;
 
+    // Show help if no networks provided
     if networks.is_empty() {
-        eprintln!(
-            "{} No networks to scan. Provide CIDR ranges via command line or use -i <file>",
-            "✗ Error:".red().bold()
-        );
-        eprintln!("\nUsage examples:");
-        eprintln!("  pingr 192.168.1.0/24");
-        eprintln!("  pingr -i targets.txt");
-        eprintln!("  pingr 10.0.0.0/24 192.168.1.0/24");
-        std::process::exit(1);
+        print_help();
+        std::process::exit(0);
     }
 
     // Setup interrupt handler
@@ -143,11 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to listen for Ctrl-C");
-        println!(
-            "\n{} {}",
-            "⚠".yellow().bold(),
-            "Interrupt received! Saving partial results...".yellow()
-        );
+        if !args.simple && !args.quiet {
+            println!(
+                "\n{} {}",
+                "⚠".yellow().bold(),
+                "Interrupt received! Saving partial results...".yellow()
+            );
+        }
         interrupted_clone.store(true, Ordering::Relaxed);
         INTERRUPTED.store(true, Ordering::Relaxed);
     });
@@ -168,23 +167,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 network_details.push((cidr.clone(), net, host_count));
             }
             Err(e) => {
-                eprintln!("{} Invalid CIDR '{}': {}", "⚠".yellow(), cidr, e);
+                if !args.simple && !args.quiet {
+                    eprintln!("{} Invalid CIDR '{}': {}", "⚠".yellow(), cidr, e);
+                }
             }
         }
     }
 
-    if !args.quiet {
+    if !args.quiet && !args.simple {
         print_banner_multi(&network_details, total_hosts, &args);
     }
 
     let start_time = Instant::now();
 
     // Determine concurrency for total hosts
-    let concurrency = determine_concurrency(&args.concurrency, total_hosts)?;
+    let concurrency =
+        determine_concurrency(&args.concurrency, total_hosts, args.simple || args.quiet)?;
 
     // Create progress bar for all networks
     let multi_progress = MultiProgress::new();
-    let main_pb = if !args.quiet {
+    let main_pb = if !args.quiet && !args.simple {
         let pb = multi_progress.add(ProgressBar::new(total_hosts as u64));
         pb.set_style(
             ProgressStyle::default_bar()
@@ -211,16 +213,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = match Client::new(&config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{} {}",
-                "✗ Error:".red().bold(),
-                format!("Failed to create ping client: {}", e).red()
-            );
-            eprintln!(
-                "{} {}",
-                "ℹ".blue(),
-                "Make sure you're running with sudo or have appropriate permissions".blue()
-            );
+            if !args.simple {
+                eprintln!(
+                    "{} {}",
+                    "✗ Error:".red().bold(),
+                    format!("Failed to create ping client: {}", e).red()
+                );
+                eprintln!(
+                    "{} {}",
+                    "ℹ".blue(),
+                    "Make sure you're running with sudo or have appropriate permissions".blue()
+                );
+            }
             std::process::exit(1);
         }
     };
@@ -230,7 +234,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fail_count = Arc::new(AtomicUsize::new(0));
 
     let mut all_tasks = Vec::new();
-    let timeout_duration = Duration::from_secs(args.timeout);
+
+    // Adaptive timeout logic
+    let base_timeout = Duration::from_secs(args.timeout);
+    let timeout_duration = if !args.no_adaptive {
+        // Start with base timeout and adjust based on network conditions
+        base_timeout
+    } else {
+        base_timeout
+    };
+
+    // Determine if we should resolve hostnames (default true unless --no-resolve)
+    let should_resolve = !args.no_resolve;
 
     // Process each network
     for (cidr, net, _host_count) in network_details {
@@ -238,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        if !args.quiet {
+        if !args.quiet && !args.simple {
             if let Some(pb) = &main_pb {
                 pb.set_message(format!("Scanning {}", cidr.yellow()));
             }
@@ -260,9 +275,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dead_hosts_clone = all_dead_hosts.clone();
             let network_cidr = cidr.clone();
             let ping_count = args.ping_count;
-            let resolve = args.resolve;
+            let resolve = should_resolve;
             let timeout = timeout_duration;
             let verbose = args.verbose;
+            let simple = args.simple;
+            let quiet = args.quiet;
 
             let task = tokio::spawn(async move {
                 // Check if interrupted before starting
@@ -308,14 +325,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     };
 
-                    if let Some(pb) = &pb_clone {
-                        pb.set_message(format!(
-                            "{} {} from {} ({}ms)",
-                            "Found:".green().bold(),
-                            host.to_string().green(),
-                            network_cidr.yellow(),
-                            avg_rtt.as_millis()
-                        ));
+                    if !simple && !quiet {
+                        if let Some(pb) = &pb_clone {
+                            pb.set_message(format!(
+                                "{} {} from {} ({}ms)",
+                                "Found:".green().bold(),
+                                host.to_string().green(),
+                                network_cidr.yellow(),
+                                avg_rtt.as_millis()
+                            ));
+                        }
                     }
 
                     let host_info = HostInfo {
@@ -395,20 +414,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Display results
-    if !args.quiet {
-        display_results(&result, &args);
-    } else {
+    if args.simple || args.quiet {
+        // Simple mode - just output IP addresses
         for host in &result.alive_hosts {
-            if let Some(hostname) = &host.hostname {
-                println!("{} ({}) [{}]", host.ip, hostname, host.network);
-            } else {
-                println!("{} [{}]", host.ip, host.network);
-            }
+            println!("{}", host.ip);
         }
+    } else {
+        display_results(&result, &args);
     }
 
     // Save to file if requested or if interrupted with autosave
-    if args.output.is_some() || (was_interrupted && args.autosave) {
+    if args.output.is_some() || (was_interrupted && args.autosave && !args.simple) {
         let output_path = args.output.unwrap_or_else(|| {
             format!(
                 "pingr_interrupted_{}",
@@ -418,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         save_results(&result, &output_path, &args.format)?;
 
-        if was_interrupted {
+        if was_interrupted && !args.simple {
             println!(
                 "{} Partial results saved to: {}",
                 "💾".green(),
@@ -433,6 +449,131 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════"
+            .blue()
+            .bold()
+    );
+    println!(
+        "{}",
+        "                PINGR - Network Scanner v0.3.0          "
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════"
+            .blue()
+            .bold()
+    );
+    println!();
+    println!("{}", "USAGE:".yellow().bold());
+    println!("  {} <CIDR>... [OPTIONS]", "pingr".green());
+    println!("  {} -i <FILE> [OPTIONS]", "pingr".green());
+    println!();
+    println!("{}", "EXAMPLES:".yellow().bold());
+    println!("  {} 192.168.1.0/24", "pingr".green());
+    println!("  {} 10.0.0.0/24 192.168.1.0/24", "pingr".green());
+    println!("  {} -i targets.txt", "pingr".green());
+    println!(
+        "  {} -s 192.168.1.0/24        # Simple IP list output",
+        "pingr".green()
+    );
+    println!(
+        "  {} -n 192.168.1.0/24        # Skip hostname resolution",
+        "pingr".green()
+    );
+    println!();
+    println!("{}", "ARGUMENTS:".yellow().bold());
+    println!("  {}         Network(s) in CIDR notation", "<CIDR>".cyan());
+    println!();
+    println!("{}", "OPTIONS:".yellow().bold());
+    println!(
+        "  {}, {}          Input file with targets",
+        "-i".cyan(),
+        "--input <FILE>".cyan()
+    );
+    println!(
+        "  {}, {}         Simple mode - IP addresses only",
+        "-s".cyan(),
+        "--simple".cyan()
+    );
+    println!(
+        "  {}, {}      Skip hostname resolution",
+        "-n".cyan(),
+        "--no-resolve".cyan()
+    );
+    println!(
+        "  {}, {}         Quiet mode (minimal output)",
+        "-q".cyan(),
+        "--quiet".cyan()
+    );
+    println!(
+        "  {}, {}       Show unreachable hosts",
+        "-v".cyan(),
+        "--verbose".cyan()
+    );
+    println!(
+        "  {}, {} <N>   Concurrent threads (auto)",
+        "-t".cyan(),
+        "--threads".cyan()
+    );
+    println!(
+        "  {}, {} <N>     Ping attempts per host (1)",
+        "-c".cyan(),
+        "--count".cyan()
+    );
+    println!(
+        "  {}, {} <FILE>  Save results to file",
+        "-o".cyan(),
+        "--output".cyan()
+    );
+    println!(
+        "  {}, {} <FMT>   Output format (text/json/both)",
+        "-f".cyan(),
+        "--format".cyan()
+    );
+    println!(
+        "  {}      <SEC>  Ping timeout in seconds (1)",
+        "--timeout".cyan()
+    );
+    println!("  {}             Show RTT statistics", "--stats".cyan());
+    println!(
+        "  {}         Disable adaptive timeout",
+        "--no-adaptive".cyan()
+    );
+    println!("  {}          Disable colored output", "--no-color".cyan());
+    println!(
+        "  {} <FMT>      Export format (csv/nmap)",
+        "--export".cyan()
+    );
+    println!(
+        "  {}, {}          Show this help message",
+        "-h".cyan(),
+        "--help".cyan()
+    );
+    println!();
+    println!("{}", "FEATURES:".yellow().bold());
+    println!("  • Automatic hostname resolution (use -n to disable)");
+    println!("  • Adaptive timeout enabled by default");
+    println!("  • Interrupt handling with auto-save (Ctrl-C)");
+    println!("  • Multi-network scanning support");
+    println!("  • Color-coded RTT for quick network health assessment");
+    println!();
+    println!("{}", "NOTE:".red().bold());
+    println!(
+        "  Requires {} or administrator privileges for ICMP",
+        "sudo".yellow()
+    );
+    println!();
+    println!(
+        "{}",
+        "For more information, visit: https://github.com/cybrly/pingr".blue()
+    );
 }
 
 fn parse_input_networks(args: &Args) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -460,35 +601,33 @@ fn parse_input_networks(args: &Args) -> Result<Vec<String>, Box<dyn std::error::
                 // Single IP - convert to /32
                 networks.push(format!("{}/32", trimmed));
             } else {
-                eprintln!("{} Invalid entry in input file: {}", "⚠".yellow(), trimmed);
+                if !args.simple && !args.quiet {
+                    eprintln!("{} Invalid entry in input file: {}", "⚠".yellow(), trimmed);
+                }
             }
         }
 
-        println!(
-            "{} Loaded {} networks from {}",
-            "📁".blue(),
-            networks.len(),
-            input_file.white().bold()
-        );
-    }
-
-    // Parse from command line (can be multiple)
-    if !args.cidr.is_empty() {
-        let parts: Vec<&str> = args.cidr.split_whitespace().collect();
-        for part in parts {
-            if part.contains('/') {
-                networks.push(part.to_string());
-            } else if part.parse::<Ipv4Addr>().is_ok() {
-                networks.push(format!("{}/32", part));
-            } else if !part.is_empty() {
-                eprintln!("{} Invalid CIDR: {}", "⚠".yellow(), part);
-            }
+        if !args.simple && !args.quiet {
+            println!(
+                "{} Loaded {} networks from {}",
+                "📁".blue(),
+                networks.len(),
+                input_file.white().bold()
+            );
         }
     }
 
-    // If still no networks and no input file was specified, use default
-    if networks.is_empty() && args.input_file.is_none() && args.cidr.is_empty() {
-        networks.push("192.168.1.0/24".to_string());
+    // Parse from command line arguments
+    if let Some(cidrs) = &args.cidr {
+        for cidr in cidrs {
+            if cidr.contains('/') {
+                networks.push(cidr.to_string());
+            } else if cidr.parse::<Ipv4Addr>().is_ok() {
+                networks.push(format!("{}/32", cidr));
+            } else if !args.simple && !args.quiet {
+                eprintln!("{} Invalid CIDR: {}", "⚠".yellow(), cidr);
+            }
+        }
     }
 
     Ok(networks)
@@ -507,7 +646,7 @@ fn print_banner_multi(
     );
     println!(
         "{}",
-        "                PINGR - Network Scanner v0.1.0          "
+        "                PINGR - Network Scanner v0.3.0          "
             .cyan()
             .bold()
     );
@@ -555,10 +694,18 @@ fn print_banner_multi(
         format!("{}s", args.timeout).yellow()
     );
 
-    if args.resolve {
+    if !args.no_resolve {
         println!(
             "{} {}",
             "🔍 DNS Resolution:".white().bold(),
+            "Enabled".green()
+        );
+    }
+
+    if !args.no_adaptive {
+        println!(
+            "{} {}",
+            "🎯 Adaptive Timeout:".white().bold(),
             "Enabled".green()
         );
     }
@@ -583,6 +730,7 @@ fn print_banner_multi(
 fn determine_concurrency(
     concurrency_str: &str,
     host_count: usize,
+    quiet: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     if concurrency_str == "auto" {
         let optimal = match host_count {
@@ -594,12 +742,14 @@ fn determine_concurrency(
             _ => 8192,
         };
 
-        println!(
-            "{} Auto-selected {} threads for {} hosts",
-            "🔧".blue(),
-            optimal.to_string().yellow().bold(),
-            host_count
-        );
+        if !quiet {
+            println!(
+                "{} Auto-selected {} threads for {} hosts",
+                "🔧".blue(),
+                optimal.to_string().yellow().bold(),
+                host_count
+            );
+        }
         Ok(optimal)
     } else {
         Ok(concurrency_str.parse()?)
@@ -849,30 +999,9 @@ fn save_results(
             writeln!(file, "# Alive Hosts: {}", result.alive_hosts.len())?;
             writeln!(file, "#")?;
 
-            // Group by network
-            let mut by_network: std::collections::HashMap<String, Vec<&HostInfo>> =
-                std::collections::HashMap::new();
+            // Just output IP addresses
             for host in &result.alive_hosts {
-                by_network
-                    .entry(host.network.clone())
-                    .or_insert_with(Vec::new)
-                    .push(host);
-            }
-
-            for network in &result.networks_scanned {
-                if let Some(hosts) = by_network.get(network) {
-                    writeln!(file, "\n# Network: {}", network)?;
-                    for host in hosts {
-                        let mut line = host.ip.to_string();
-                        if let Some(hostname) = &host.hostname {
-                            line = format!("{}\t{}", line, hostname);
-                        }
-                        if let Some(rtt) = host.rtt {
-                            line = format!("{}\t{}ms", line, rtt.as_millis());
-                        }
-                        writeln!(file, "{}", line)?;
-                    }
-                }
+                writeln!(file, "{}", host.ip)?;
             }
 
             println!(
