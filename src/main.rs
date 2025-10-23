@@ -320,7 +320,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Resolve hostname if requested
                     let hostname = if resolve {
-                        lookup_addr(&IpAddr::V4(host)).ok()
+                        // Use spawn_blocking for DNS lookup to avoid blocking the async runtime
+                        match tokio::task::spawn_blocking(move || {
+                            lookup_addr(&IpAddr::V4(host))
+                        }).await {
+                            Ok(Ok(hostname)) => Some(hostname),
+                            _ => None,
+                        }
                     } else {
                         None
                     };
